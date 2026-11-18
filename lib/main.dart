@@ -1,9 +1,22 @@
+
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
-void main() {
+import 'firebase_options.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+
   runApp(const ScienceSignalApp());
 }
 
@@ -16,13 +29,17 @@ class ScienceSignalApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'Science Signal',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.teal,
+        ),
         useMaterial3: true,
       ),
-      home: const QuizPage(),
+      home: const AuthGate(),
     );
   }
 }
+
+// SCIENCE QUESTION MODEL
 
 class ScienceQuestion {
   final String text;
@@ -34,26 +51,200 @@ class ScienceQuestion {
   });
 
   factory ScienceQuestion.fromJson(Map<String, dynamic> json) {
-    final question = json['question'];
-    final correctAnswer = json['correct_answer'];
+    String decodeField(String key) {
+      final value = json[key];
 
-    if (question is! String || correctAnswer is! String) {
-      throw const FormatException('Invalid question data.');
+      if (value is! String || value.isEmpty) {
+        throw FormatException('Missing or invalid $key');
+      }
+
+      final decoded = Uri.decodeComponent(value);
+
+      if (decoded.trim().isEmpty) {
+        throw FormatException('Empty $key');
+      }
+
+      return decoded;
     }
 
-    final decodedQuestion = Uri.decodeComponent(question);
-    final decodedAnswer = Uri.decodeComponent(correctAnswer);
+    final category = decodeField('category');
+    final difficulty = decodeField('difficulty');
+    final type = decodeField('type');
+    final question = decodeField('question');
+    final correct = decodeField('correct_answer');
 
-    if (decodedAnswer != 'True' && decodedAnswer != 'False') {
-      throw const FormatException('Invalid answer data.');
+    final incorrectList = json['incorrect_answers'];
+
+    if (category != 'Science & Nature' ||
+        difficulty != 'medium' ||
+        type != 'boolean' ||
+        incorrectList is! List ||
+        incorrectList.length != 1 ||
+        incorrectList.first is! String) {
+      throw const FormatException(
+        'Invalid Science and Nature question format.',
+      );
+    }
+
+    final incorrect = Uri.decodeComponent(
+      incorrectList.first as String,
+    );
+
+    final validAnswers =
+        (correct == 'True' && incorrect == 'False') ||
+        (correct == 'False' && incorrect == 'True');
+
+    if (!validAnswers) {
+      throw const FormatException(
+        'Expected exactly True and False answers.',
+      );
     }
 
     return ScienceQuestion(
-      text: decodedQuestion,
-      correctAnswer: decodedAnswer,
+      text: question,
+      correctAnswer: correct,
     );
   }
 }
+
+// FIRESTORE REPOSITORY
+
+class AttemptRepository {
+  final FirebaseFirestore firestore =
+      FirebaseFirestore.instance;
+
+  DocumentReference<Map<String, dynamic>> reference(
+    String uid,
+    String roundId,
+  ) {
+    return firestore
+        .collection('users')
+        .doc(uid)
+        .collection('attempts')
+        .doc(roundId);
+  }
+
+  String newRoundId(String uid) {
+    return firestore
+        .collection('users')
+        .doc(uid)
+        .collection('attempts')
+        .doc()
+        .id;
+  }
+
+  Map<String, dynamic> fixedData(int score) {
+    return {
+      'schemaVersion': 1,
+      'variant': 'B',
+      'categoryId': 17,
+      'questionCount': 5,
+      'correctCount': score,
+    };
+  }
+
+  bool matches(
+    Map<String, dynamic>? data,
+    int score,
+  ) {
+    if (data == null || data.length != 6) {
+      return false;
+    }
+
+    final expected = fixedData(score);
+
+    for (final entry in expected.entries) {
+      if (data[entry.key] != entry.value) {
+        return false;
+      }
+    }
+
+    return data['submittedAt'] is Timestamp;
+  }
+
+  Future<void> commitOnce({
+    required String uid,
+    required String roundId,
+    required int score,
+  }) async {
+    final ref = reference(uid, roundId);
+
+    final payload = {
+      ...fixedData(score),
+      'submittedAt': FieldValue.serverTimestamp(),
+    };
+
+    await firestore.runTransaction<void>((transaction) async {
+      final existing = await transaction.get(ref);
+
+      if (!existing.exists) {
+        transaction.set(ref, payload);
+        return;
+      }
+
+      if (!matches(existing.data(), score)) {
+        throw StateError(
+          'Collision: this round ID already contains '
+          'a different or invalid attempt.',
+        );
+      }
+
+      // Matching attempt exists.
+      // Do not create a second document or update it.
+    });
+  }
+
+  Future<DocumentSnapshot<Map<String, dynamic>>> verify({
+    required String uid,
+    required String roundId,
+    required int score,
+  }) async {
+    final snapshot = await reference(
+      uid,
+      roundId,
+    ).get(
+      const GetOptions(source: Source.server),
+    );
+
+    if (!snapshot.exists ||
+        !matches(snapshot.data(), score) ||
+        snapshot.metadata.isFromCache ||
+        snapshot.metadata.hasPendingWrites) {
+      throw StateError(
+        'The server record is missing or does not match.',
+      );
+    }
+
+    return snapshot;
+  }
+
+  Future<QuerySnapshot<Map<String, dynamic>>> recentAttempts(
+    String uid,
+  ) {
+    return firestore
+        .collection('users')
+        .doc(uid)
+        .collection('attempts')
+        .orderBy('submittedAt', descending: true)
+        .limit(5)
+        .get(const GetOptions(source: Source.server));
+  }
+}
+
+// CLOUD STATES
+
+enum SaveState {
+  ready,
+  submitting,
+  verifying,
+  cloudVerified,
+  verificationUnavailable,
+  saveUnknown,
+  permissionDenied,
+  collision,
+}
+
+// QUIZ SCREEN
 
 class QuizPage extends StatefulWidget {
   const QuizPage({super.key});
@@ -63,157 +254,505 @@ class QuizPage extends StatefulWidget {
 }
 
 class _QuizPageState extends State<QuizPage> {
-  List<ScienceQuestion> _questions = [];
-  List<String?> _selectedAnswers = [];
+  final AttemptRepository repository = AttemptRepository();
 
-  bool _isLoading = true;
-  bool _isSubmitting = false;
-  bool _submissionComplete = false;
+  List<ScienceQuestion> questions = [];
+  List<String?> answers = [];
 
-  String? _errorMessage;
-  String? _currentSelection;
+  bool loading = true;
+  String? requestError;
+  String? selectedAnswer;
 
-  int _currentIndex = 0;
-  int _score = 0;
+  int currentIndex = 0;
+  int score = 0;
+
+  late final String uid;
+  late String roundId;
+
+  int? frozenScore;
+
+  SaveState saveState = SaveState.ready;
+
+  String saveMessage = 'Not submitted yet.';
+  String? serverMessage;
+
+  bool transactionRunning = false;
+  bool verificationRunning = false;
+
+  bool injectVerificationFailure = false;
+  bool injectionUsed = false;
+
+  DateTime? lastApiRequest;
+  int requestGeneration = 0;
+
+  bool get sameUser =>
+      FirebaseAuth.instance.currentUser?.uid == uid;
+
+  bool get unresolved =>
+      transactionRunning ||
+      verificationRunning ||
+      saveState == SaveState.submitting ||
+      saveState == SaveState.verifying ||
+      saveState == SaveState.saveUnknown ||
+      saveState == SaveState.verificationUnavailable ||
+      saveState == SaveState.permissionDenied;
 
   @override
   void initState() {
     super.initState();
-    _fetchQuestions();
+
+    uid = FirebaseAuth.instance.currentUser!.uid;
+    roundId = repository.newRoundId(uid);
+
+    unawaited(fetchQuestions());
   }
 
-  Future<void> _fetchQuestions() async {
+  // LOAD QUESTIONS
+
+  Future<void> fetchQuestions() async {
+    if (unresolved || !sameUser) return;
+
+    final now = DateTime.now();
+
+    if (lastApiRequest != null &&
+        now.difference(lastApiRequest!) <
+            const Duration(seconds: 5)) {
+      setState(() {
+        loading = false;
+        requestError =
+            'Please wait five seconds before retrying.';
+      });
+      return;
+    }
+
+    lastApiRequest = now;
+    final generation = ++requestGeneration;
+
     setState(() {
-      _isLoading = true;
-      _errorMessage = null;
-      _questions = [];
-      _selectedAnswers = [];
-      _currentIndex = 0;
-      _score = 0;
-      _currentSelection = null;
-      _submissionComplete = false;
+      loading = true;
+      requestError = null;
+      questions = [];
+      answers = [];
+      currentIndex = 0;
+      score = 0;
+      selectedAnswer = null;
+      frozenScore = null;
+
+      saveState = SaveState.ready;
+      saveMessage = 'Not submitted yet.';
+      serverMessage = null;
+      injectionUsed = false;
     });
 
     try {
-      final uri = Uri.https(
-        'opentdb.com',
-        '/api.php',
-        {
-          'amount': '5',
-          'category': '17',
-          'difficulty': 'medium',
-          'type': 'boolean',
-          'encode': 'url3986',
-        },
+      final url = Uri.https('opentdb.com', '/api.php', {
+        'amount': '5',
+        'category': '17',
+        'difficulty': 'medium',
+        'type': 'boolean',
+        'encode': 'url3986',
+      });
+
+      final response = await http.get(url).timeout(
+        const Duration(seconds: 10),
       );
 
-      final response = await http.get(uri);
-
       if (response.statusCode != 200) {
-        throw Exception(
-          'Request failed with HTTP status ${response.statusCode}.',
+        throw FormatException(
+          'HTTP error: ${response.statusCode}',
         );
       }
 
-      final data = jsonDecode(response.body);
+      final decoded = jsonDecode(response.body);
 
-      if (data is! Map<String, dynamic>) {
-        throw const FormatException('Invalid API response.');
-      }
-
-      if (data['response_code'] != 0) {
-        throw Exception(
-          'Trivia API returned response code ${data['response_code']}.',
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException(
+          'Invalid JSON response.',
         );
       }
 
-      final results = data['results'];
+      if (decoded['response_code'] != 0) {
+        throw FormatException(
+          'API response code: ${decoded['response_code']}',
+        );
+      }
+
+      final results = decoded['results'];
 
       if (results is! List || results.length != 5) {
         throw const FormatException(
-          'The API did not return exactly five questions.',
+          'The API must return exactly five questions.',
         );
       }
 
-      final questions = results
-          .map(
-            (item) => ScienceQuestion.fromJson(
-              Map<String, dynamic>.from(item as Map),
-            ),
-          )
-          .toList();
+      final loadedQuestions = results.map((item) {
+        if (item is! Map) {
+          throw const FormatException(
+            'Invalid question record.',
+          );
+        }
 
-      if (!mounted) return;
+        return ScienceQuestion.fromJson(
+          Map<String, dynamic>.from(item),
+        );
+      }).toList();
+
+      if (!mounted ||
+          !sameUser ||
+          generation != requestGeneration) {
+        return;
+      }
 
       setState(() {
-        _questions = questions;
-        _selectedAnswers = List<String?>.filled(questions.length, null);
-        _isLoading = false;
+        questions = loadedQuestions;
+        answers = List<String?>.filled(5, null);
+        loading = false;
       });
     } catch (error) {
-      if (!mounted) return;
+      if (!mounted ||
+          !sameUser ||
+          generation != requestGeneration) {
+        return;
+      }
 
       setState(() {
-        _isLoading = false;
-        _errorMessage = 'Could not load the quiz.\n$error';
+        loading = false;
+        requestError = 'Could not load the quiz.\n$error';
       });
     }
   }
 
-  void _selectAnswer(String answer) {
-    if (_currentSelection != null) {
+  // ANSWER HANDLING
+
+  void chooseAnswer(String answer) {
+    if (!sameUser ||
+        selectedAnswer != null ||
+        currentIndex >= questions.length) {
       return;
     }
 
-    final question = _questions[_currentIndex];
-    final isCorrect = answer == question.correctAnswer;
-
     setState(() {
-      _currentSelection = answer;
-      _selectedAnswers[_currentIndex] = answer;
+      selectedAnswer = answer;
+      answers[currentIndex] = answer;
 
-      if (isCorrect) {
-        _score++;
+      if (answer == questions[currentIndex].correctAnswer) {
+        score++;
       }
     });
   }
 
-  void _continueQuiz() {
-    if (_currentSelection == null) {
+  void continueQuiz() {
+    if (selectedAnswer == null) return;
+
+    setState(() {
+      currentIndex++;
+      selectedAnswer = null;
+    });
+  }
+
+  // CLOUD SUBMISSION
+
+  Future<void> submitCloud() async {
+    if (!sameUser ||
+        saveState != SaveState.ready ||
+        transactionRunning ||
+        currentIndex != 5 ||
+        questions.length != 5) {
       return;
     }
 
-    if (_currentIndex < _questions.length - 1) {
+    frozenScore = score;
+    transactionRunning = true;
+
+    setState(() {
+      saveState = SaveState.submitting;
+      saveMessage = 'Saving your score to Firestore...';
+    });
+
+    final commit = repository.commitOnce(
+      uid: uid,
+      roundId: roundId,
+      score: frozenScore!,
+    );
+
+    try {
+      await commit.timeout(const Duration(seconds: 10));
+
+      transactionRunning = false;
+
+      if (!mounted || !sameUser) return;
+
+      await verifyCloud();
+    } on TimeoutException {
+      if (!mounted || !sameUser) return;
+
       setState(() {
-        _currentIndex++;
-        _currentSelection = null;
+        saveState = SaveState.saveUnknown;
+        saveMessage =
+            'Save outcome unknown. The transaction may '
+            'still be running. Keep this round ID.';
       });
-    } else {
+
+      // Observe the original transaction after the UI timeout.
+      unawaited(
+        commit.then((_) {
+          transactionRunning = false;
+
+          if (mounted &&
+              sameUser &&
+              saveState == SaveState.saveUnknown) {
+            setState(() {
+              saveMessage =
+                  'Transaction finished. Recheck the original round.';
+            });
+          }
+        }).catchError((Object error) {
+          transactionRunning = false;
+
+          if (mounted &&
+              sameUser &&
+              saveState == SaveState.saveUnknown) {
+            setState(() {
+              saveMessage =
+                  'Transaction ended with an error. '
+                  'Recheck the same round before trying again.';
+            });
+          }
+        }),
+      );
+    } on StateError catch (error) {
+      transactionRunning = false;
+
+      if (!mounted || !sameUser) return;
+
       setState(() {
-        _currentIndex = _questions.length;
-        _currentSelection = null;
+        saveState = SaveState.collision;
+        saveMessage = error.message.toString();
+      });
+    } on FirebaseException catch (error) {
+      transactionRunning = false;
+
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveState = error.code == 'permission-denied'
+            ? SaveState.permissionDenied
+            : SaveState.saveUnknown;
+
+        saveMessage =
+            'Commit not confirmed (${error.code}). '
+            'Recheck the original round.';
+      });
+    } catch (error) {
+      transactionRunning = false;
+
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveState = SaveState.saveUnknown;
+        saveMessage = 'Commit not confirmed: $error';
       });
     }
   }
 
-  Future<void> _simulateSubmission() async {
-    if (_isSubmitting || _submissionComplete) {
+  // REAL SERVER VERIFICATION
+
+  Future<void> verifyCloud() async {
+    if (!sameUser ||
+        transactionRunning ||
+        verificationRunning ||
+        frozenScore == null) {
       return;
     }
 
-    setState(() {
-      _isSubmitting = true;
-    });
-
-    await Future<void>.delayed(const Duration(seconds: 1));
-
-    if (!mounted) return;
+    verificationRunning = true;
 
     setState(() {
-      _isSubmitting = false;
-      _submissionComplete = true;
+      saveState = SaveState.verifying;
+      saveMessage =
+          'Checking the saved record on the server...';
     });
+
+    try {
+      // Development-only fault injection.
+      // The transaction itself is always real.
+      if (injectVerificationFailure && !injectionUsed) {
+        injectionUsed = true;
+
+        throw FirebaseException(
+          plugin: 'cloud_firestore',
+          code: 'permission-denied',
+          message: 'DEV TEST: verification failure injected',
+        );
+      }
+
+      final snapshot = await repository.verify(
+        uid: uid,
+        roundId: roundId,
+        score: frozenScore!,
+      );
+
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveState = SaveState.cloudVerified;
+
+        saveMessage =
+            'Cloud verified. This exact attempt exists '
+            'on the server.';
+
+        serverMessage =
+            'Round ID: ${snapshot.id}\n'
+            'Score: ${snapshot.data()!['correctCount']}/5\n'
+            'Server timestamp: ${snapshot.data()!['submittedAt']}';
+      });
+    } on FirebaseException catch (error) {
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveState = SaveState.verificationUnavailable;
+
+        saveMessage =
+            'Write acknowledged; verification unavailable '
+            '(${error.code}). Recheck the same round ID.';
+      });
+    } catch (error) {
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveState = SaveState.verificationUnavailable;
+
+        saveMessage =
+            'Write acknowledged; verification unavailable: $error';
+      });
+    } finally {
+      verificationRunning = false;
+    }
   }
+
+  // RETRY SERVER VERIFICATION
+
+  Future<void> recheckOriginalRound() async {
+    if (!sameUser ||
+        transactionRunning ||
+        verificationRunning ||
+        frozenScore == null) {
+      return;
+    }
+
+    // A confirmed commit followed by failed verification
+    // only needs another read.
+    if (saveState == SaveState.verificationUnavailable) {
+      await verifyCloud();
+      return;
+    }
+
+    verificationRunning = true;
+
+    setState(() {
+      saveMessage = 'Rechecking the original round...';
+    });
+
+    try {
+      final snapshot = await repository.verify(
+        uid: uid,
+        roundId: roundId,
+        score: frozenScore!,
+      );
+
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveState = SaveState.cloudVerified;
+        saveMessage = 'Cloud verified after recovery.';
+
+        serverMessage =
+            'Recovered original round: ${snapshot.id}\n'
+            'Score: ${snapshot.data()!['correctCount']}/5';
+      });
+    } on FirebaseException catch (error) {
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveMessage =
+            'Recheck failed (${error.code}). '
+            'The original round has not been verified. '
+            'Do not create a second attempt.';
+      });
+    } catch (error) {
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        saveMessage =
+            'Original round is not verified: $error. '
+            'Keep the same round ID.';
+      });
+    } finally {
+      verificationRunning = false;
+    }
+  }
+
+  // RETRIEVE PREVIOUS ATTEMPT
+
+  Future<void> retrievePreviousAttempt() async {
+    if (!sameUser || unresolved) return;
+
+    try {
+      final recent = await repository.recentAttempts(uid);
+
+      if (!mounted || !sameUser) return;
+
+      if (recent.docs.isEmpty) {
+        setState(() {
+          serverMessage = 'No saved attempts found.';
+        });
+        return;
+      }
+
+      final latest = recent.docs.first;
+      final savedScore = latest.data()['correctCount'];
+
+      if (savedScore is! int) {
+        throw StateError('Invalid stored score.');
+      }
+
+      final snapshot = await repository.verify(
+        uid: uid,
+        roundId: latest.id,
+        score: savedScore,
+      );
+
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        serverMessage =
+            'Retrieved previous attempt from the server.\n'
+            'Round ID: ${snapshot.id}\n'
+            'Score: $savedScore/5\n'
+            'Timestamp: ${snapshot.data()!['submittedAt']}';
+      });
+    } catch (error) {
+      if (!mounted || !sameUser) return;
+
+      setState(() {
+        serverMessage = 'Retrieval failed: $error';
+      });
+    }
+  }
+
+  // REPLAY
+
+  Future<void> replay() async {
+    if (unresolved || !sameUser) return;
+
+    setState(() {
+      roundId = repository.newRoundId(uid);
+    });
+
+    await fetchQuestions();
+  }
+
+  // MAIN SCREEN
 
   @override
   Widget build(BuildContext context) {
@@ -221,13 +760,22 @@ class _QuizPageState extends State<QuizPage> {
       appBar: AppBar(
         title: const Text('Science Signal'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'Sign out',
+            onPressed: unresolved
+                ? null
+                : () => FirebaseAuth.instance.signOut(),
+            icon: const Icon(Icons.logout),
+          ),
+        ],
       ),
-      body: _buildBody(),
+      body: buildBody(),
     );
   }
 
-  Widget _buildBody() {
-    if (_isLoading) {
+  Widget buildBody() {
+    if (loading) {
       return const Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -240,25 +788,22 @@ class _QuizPageState extends State<QuizPage> {
       );
     }
 
-    if (_errorMessage != null) {
+    if (requestError != null) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(
-                Icons.error_outline,
-                size: 60,
-              ),
+              const Icon(Icons.error_outline, size: 50),
               const SizedBox(height: 16),
               Text(
-                _errorMessage!,
+                requestError!,
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 16),
               FilledButton(
-                onPressed: _fetchQuestions,
+                onPressed: fetchQuestions,
                 child: const Text('Retry'),
               ),
             ],
@@ -267,74 +812,83 @@ class _QuizPageState extends State<QuizPage> {
       );
     }
 
-    if (_currentIndex >= _questions.length) {
-      return _buildResults();
+    if (currentIndex >= questions.length) {
+      return buildResults();
     }
 
-    return _buildQuestion();
+    return buildQuestion();
   }
 
-  Widget _buildQuestion() {
-    final question = _questions[_currentIndex];
-    final answered = _currentSelection != null;
-    final isCorrect = _currentSelection == question.correctAnswer;
+  // QUESTION SCREEN
 
-    return Padding(
+  Widget buildQuestion() {
+    final question = questions[currentIndex];
+
+    final answered = selectedAnswer != null;
+
+    final correct =
+        selectedAnswer == question.correctAnswer;
+
+    return ListView(
       padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
+      children: [
+        Text(
+          'Question ${currentIndex + 1} of 5',
+          style: Theme.of(context).textTheme.titleMedium,
+        ),
+        const SizedBox(height: 8),
+        LinearProgressIndicator(
+          value: (currentIndex + 1) / 5,
+        ),
+        const SizedBox(height: 28),
+        Text(
+          question.text,
+          style: Theme.of(context).textTheme.headlineSmall,
+        ),
+        const SizedBox(height: 24),
+        FilledButton(
+          onPressed: answered
+              ? null
+              : () => chooseAnswer('True'),
+          child: const Text('True'),
+        ),
+        const SizedBox(height: 12),
+        FilledButton(
+          onPressed: answered
+              ? null
+              : () => chooseAnswer('False'),
+          child: const Text('False'),
+        ),
+        if (answered) ...[
+          const SizedBox(height: 24),
           Text(
-            'Question ${_currentIndex + 1} of ${_questions.length}',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
-          const SizedBox(height: 8),
-          LinearProgressIndicator(
-            value: (_currentIndex + 1) / _questions.length,
-          ),
-          const SizedBox(height: 32),
-          Text(
-            question.text,
-            style: Theme.of(context).textTheme.headlineSmall,
-          ),
-          const SizedBox(height: 32),
-          FilledButton(
-            onPressed: answered ? null : () => _selectAnswer('True'),
-            child: const Text('True'),
-          ),
-          const SizedBox(height: 12),
-          FilledButton(
-            onPressed: answered ? null : () => _selectAnswer('False'),
-            child: const Text('False'),
-          ),
-          if (answered) ...[
-            const SizedBox(height: 28),
-            Text(
-              isCorrect
-                  ? 'Correct!'
-                  : 'Incorrect. Correct answer: ${question.correctAnswer}',
-              style: TextStyle(
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-                color: isCorrect ? Colors.green : Colors.red,
-              ),
+            correct
+                ? 'Correct!'
+                : 'Incorrect. Correct answer: '
+                    '${question.correctAnswer}',
+            style: TextStyle(
+              color: correct ? Colors.green : Colors.red,
+              fontSize: 18,
+              fontWeight: FontWeight.bold,
             ),
-            const SizedBox(height: 20),
-            FilledButton(
-              onPressed: _continueQuiz,
-              child: Text(
-                _currentIndex == _questions.length - 1
-                    ? 'View Results'
-                    : 'Continue',
-              ),
+          ),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: continueQuiz,
+            child: Text(
+              currentIndex == 4
+                  ? 'View Results'
+                  : 'Continue',
             ),
-          ],
+          ),
         ],
-      ),
+      ],
     );
   }
 
-  Widget _buildResults() {
+  // RESULTS SCREEN
+
+  Widget buildResults() {
     return ListView(
       padding: const EdgeInsets.all(24),
       children: [
@@ -344,22 +898,28 @@ class _QuizPageState extends State<QuizPage> {
         ),
         const SizedBox(height: 8),
         Text(
-          'Score: $_score / ${_questions.length}',
+          'Score: $score / 5',
           style: Theme.of(context).textTheme.headlineSmall,
         ),
-        const SizedBox(height: 24),
-        const Text(
+        const SizedBox(height: 12),
+        Text(
+          'Signed in: '
+          '${FirebaseAuth.instance.currentUser?.email ?? ''}',
+        ),
+        Text(
+          'Round ID: $roundId',
+          style: const TextStyle(fontSize: 12),
+        ),
+        const SizedBox(height: 20),
+        Text(
           'Answer Review',
-          style: TextStyle(
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-          ),
+          style: Theme.of(context).textTheme.titleLarge,
         ),
         const SizedBox(height: 12),
-        ...List.generate(_questions.length, (index) {
-          final question = _questions[index];
-          final selected = _selectedAnswers[index];
-          final correct = selected == question.correctAnswer;
+        ...List.generate(5, (index) {
+          final question = questions[index];
+          final correct =
+              answers[index] == question.correctAnswer;
 
           return Card(
             margin: const EdgeInsets.only(bottom: 12),
@@ -375,14 +935,16 @@ class _QuizPageState extends State<QuizPage> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  Text('Your answer: ${selected ?? "No answer"}'),
-                  Text('Correct answer: ${question.correctAnswer}'),
-                  const SizedBox(height: 4),
+                  Text('Your answer: ${answers[index]}'),
+                  Text(
+                    'Correct answer: '
+                    '${question.correctAnswer}',
+                  ),
                   Text(
                     correct ? 'Correct' : 'Incorrect',
                     style: TextStyle(
-                      color: correct ? Colors.green : Colors.red,
-                      fontWeight: FontWeight.bold,
+                      color:
+                          correct ? Colors.green : Colors.red,
                     ),
                   ),
                 ],
@@ -390,42 +952,222 @@ class _QuizPageState extends State<QuizPage> {
             ),
           );
         }),
-        const SizedBox(height: 12),
+        const SizedBox(height: 16),
         FilledButton(
-          onPressed: _isSubmitting || _submissionComplete
-              ? null
-              : _simulateSubmission,
+          onPressed: saveState == SaveState.ready
+              ? submitCloud
+              : null,
           child: Text(
-            _isSubmitting
-                ? 'Simulating submission...'
-                : _submissionComplete
-                    ? 'Simulation Complete'
-                    : 'Simulate Score Submission',
+            saveState == SaveState.ready
+                ? 'Save Score to Firestore'
+                : saveState == SaveState.cloudVerified
+                    ? 'Cloud Verified'
+                    : 'Cloud Status: ${saveState.name}',
           ),
         ),
-        if (_submissionComplete) ...[
-          const SizedBox(height: 16),
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
+        if (saveState == SaveState.ready) ...[
+          const SizedBox(height: 12),
+          SwitchListTile(
+            title: const Text(
+              'DEV TEST: deny first verification',
+            ),
+            subtitle: const Text(
+              'The real Firestore write still happens. '
+              'Only the first verification read is simulated '
+              'as denied.',
+            ),
+            value: injectVerificationFailure,
+            onChanged: (value) {
+              setState(() {
+                injectVerificationFailure = value;
+              });
+            },
+          ),
+        ],
+        const SizedBox(height: 14),
+        Text(saveMessage),
+        if (serverMessage != null) ...[
+          const SizedBox(height: 12),
+          Text(serverMessage!),
+        ],
+        if ((saveState ==
+                    SaveState.verificationUnavailable ||
+                saveState == SaveState.saveUnknown ||
+                saveState == SaveState.permissionDenied) &&
+            !transactionRunning &&
+            !verificationRunning)
+          OutlinedButton(
+            onPressed: recheckOriginalRound,
+            child: const Text(
+              'Recheck Original Round on Server',
+            ),
+          ),
+        const SizedBox(height: 12),
+        OutlinedButton(
+          onPressed: unresolved ? null : replay,
+          child: const Text(
+            'Replay with New Questions',
+          ),
+        ),
+        TextButton(
+          onPressed: unresolved
+              ? null
+              : retrievePreviousAttempt,
+          child: const Text(
+            'Retrieve Latest Saved Attempt',
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// AUTHENTICATION GATE
+
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState ==
+            ConnectionState.waiting) {
+          return const Scaffold(
+            body: Center(
+              child: CircularProgressIndicator(),
+            ),
+          );
+        }
+
+        if (snapshot.hasError) {
+          return Scaffold(
+            body: Center(
               child: Text(
-                'Simulation only. No backend request was sent.\n\n'
-                'Payload:\n'
-                '{\n'
-                '  "score": $_score,\n'
-                '  "total": ${_questions.length},\n'
-                '  "category": "Science & Nature"\n'
-                '}',
+                'Authentication error: ${snapshot.error}',
               ),
+            ),
+          );
+        }
+
+        if (snapshot.hasData) {
+          return const QuizPage();
+        }
+
+        return const LoginPage();
+      },
+    );
+  }
+}
+
+// LOGIN SCREEN
+
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final emailController = TextEditingController();
+  final passwordController = TextEditingController();
+
+  bool signingIn = false;
+  String? loginError;
+
+  Future<void> signIn() async {
+    if (signingIn) return;
+
+    setState(() {
+      signingIn = true;
+      loginError = null;
+    });
+
+    try {
+      await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: emailController.text.trim(),
+        password: passwordController.text,
+      );
+    } on FirebaseAuthException catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        loginError =
+            error.message ?? 'Could not sign in.';
+      });
+    } catch (_) {
+      if (!mounted) return;
+
+      setState(() {
+        loginError =
+            'Something went wrong. Please try again.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          signingIn = false;
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    emailController.dispose();
+    passwordController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Science Signal Login'),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(24),
+        children: [
+          const SizedBox(height: 100),
+          const Text(
+            'Sign in to continue',
+            style: TextStyle(fontSize: 24),
+          ),
+          const SizedBox(height: 20),
+          TextField(
+            controller: emailController,
+            keyboardType: TextInputType.emailAddress,
+            decoration: const InputDecoration(
+              labelText: 'Email',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: passwordController,
+            obscureText: true,
+            decoration: const InputDecoration(
+              labelText: 'Password',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          if (loginError != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              loginError!,
+              style: const TextStyle(color: Colors.red),
+            ),
+          ],
+          const SizedBox(height: 20),
+          FilledButton(
+            onPressed: signingIn ? null : signIn,
+            child: Text(
+              signingIn ? 'Signing in...' : 'Sign In',
             ),
           ),
         ],
-        const SizedBox(height: 12),
-        OutlinedButton(
-          onPressed: _fetchQuestions,
-          child: const Text('Replay with New Questions'),
-        ),
-      ],
+      ),
     );
   }
 }

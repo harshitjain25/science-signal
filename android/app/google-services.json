@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "269764564408",
+    "project_id": "harshit-ica16-class-b",
+    "storage_bucket": "harshit-ica16-class-b.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:269764564408:android:5957dbda641808d7662b4d",
+        "android_client_info": {
+          "package_name": "com.example.science_signal"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAzhKgjVY0Rj9hNSKAU-zCdJ7BnLCL8vwM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
