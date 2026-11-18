@@ -1,0 +1,24 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "harshit-ica16-class-b",
+          "appId": "1:269764564408:android:5957dbda641808d7662b4d",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "harshit-ica16-class-b",
+          "configurations": {
+            "android": "1:269764564408:android:5957dbda641808d7662b4d"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}
